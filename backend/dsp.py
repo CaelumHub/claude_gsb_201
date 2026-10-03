@@ -841,9 +841,12 @@ class StreamingResampler:
         self.ratio = src_sr / dst_sr
         self.pos = 0.0
         self.buf: List[float] = []
+        self.in_count = 0  # total source frames pushed so far
+        self.out_count = 0  # total destination frames emitted so far
 
     def push(self, block: Sequence[float]) -> None:
         self.buf.extend(block)
+        self.in_count += len(block)
 
     def pull(self, max_out: int) -> List[float]:
         out: List[float] = []
@@ -861,13 +864,25 @@ class StreamingResampler:
             del buf[:consumed]
             pos -= consumed
         self.pos = pos
+        self.out_count += len(out)
         return out
 
     def flush(self, max_out: int) -> List[float]:
-        """Pull any remaining samples, including a final partial one."""
-        if not self.buf:
-            return []
-        return self.pull(max_out)
+        """Pull remaining samples so the stream has a deterministic length.
+
+        The interpolation loop needs two source samples and therefore never
+        emits a final frame whose position lands on the last source sample.
+        Depending on chunk boundary timing (fractional ``pos`` accumulation)
+        that frame is occasionally missed; hold the last source sample's value
+        (zero-order hold) for it so the total output length is always
+        ``round(input_frames / ratio)`` regardless of block size.
+        """
+        out = self.pull(max_out)
+        expected = int(round(self.in_count / self.ratio)) if self.ratio else 0
+        if self.out_count < expected and self.buf:
+            out.append(self.buf[-1])
+            self.out_count += 1
+        return out
 
 
 def fade_in_out(samples: Sequence[float], fade_sec: float, sr: float) -> List[float]:
