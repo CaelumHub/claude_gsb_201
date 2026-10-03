@@ -49,10 +49,19 @@ def mixdown(tracks: Sequence[Dict], out_path: str, target_sr: Optional[int] = No
         readers.append((r, t))
 
     sr = target_sr or max(r.sr for r, _ in readers)
-    # Streaming resamplers for tracks that need rate conversion.
-    resamplers: List[Optional[dsp.StreamingResampler]] = []
+    # Streaming resamplers for tracks that need rate conversion — ONE PER
+    # CHANNEL.  A resampler carries interpolation state (its input buffer and
+    # fractional position), so channels must never share one: pushing L and R
+    # through a single instance would interleave both channels in one buffer,
+    # swapping samples between channels at every block boundary and dropping
+    # samples (audible as clicks, crosstalk and a wandering stereo image).
+    resamplers: List[Optional[List[dsp.StreamingResampler]]] = []
     for r, _ in readers:
-        resamplers.append(dsp.StreamingResampler(r.sr, sr) if r.sr != sr else None)
+        if r.sr != sr:
+            resamplers.append([dsp.StreamingResampler(r.sr, sr)
+                               for _ in range(r.channels)])
+        else:
+            resamplers.append(None)
 
     total_frames = 0
     with audio_io.WavWriter(out_path, sr, 2, 2) as w:
@@ -69,23 +78,22 @@ def mixdown(tracks: Sequence[Dict], out_path: str, target_sr: Optional[int] = No
                 src_frames = max(1, int(chunk * r.sr / sr)) if rs else chunk
                 raw = r.read_chunk(src_frames)
                 if raw is None:
-                    # Drain a resampler's trailing samples, if any.
+                    # EOF: drain each channel's resampler once, then finish.
+                    # The drained tail is already at the output rate — mix it
+                    # directly, never push it back through the resampler.
                     if rs is not None:
-                        tail = [rs.pull(chunk) for _ in range(r.channels)]
-                        if any(tail):
-                            raw = tail
-                        else:
+                        out_ch = [c.flush(chunk) for c in rs]
+                        if not any(out_ch):
                             done[i] = True
                             continue
                     else:
                         done[i] = True
                         continue
-
-                if rs is not None:
+                elif rs is not None:
                     out_ch = []
                     for c, ch_data in enumerate(raw):
-                        rs.push(ch_data)
-                        out_ch.append(rs.pull(chunk))
+                        rs[c].push(ch_data)
+                        out_ch.append(rs[c].pull(chunk))
                 else:
                     out_ch = [list(x) for x in raw]
 
